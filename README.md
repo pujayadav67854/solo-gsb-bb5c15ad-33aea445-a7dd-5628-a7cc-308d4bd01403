@@ -33,6 +33,13 @@ YAML 场景，服务按**会话令牌**隔离每个调用方的当前状态，�
 结果与 `first_difference`，任一侧单步失败只记录该侧、不影响另一侧。整个过程
 **不写 sessions/events、不持久化随机计数**，可反复调用。
 
+发布前还可用**状态可达性诊断**做静态体检：`POST /__scenarios/analyze` 接收待发布的
+YAML（与 `/validate` 同一套解析校验，**不写数据库**），按每条规则的 `state` 条件
+筛选可能的源状态，把规则的 `next_state` 与状态超时迁移组成有向图，从
+`initial_state` 遍历，返回**不可达状态**、**无法触发的规则**与每个可达状态的
+**最短迁移路径**。非 `state` 条件只视为可能满足；含模板或无法静态确定的 `state`
+条件也保守保留边，避免误报不可达。诊断不影响实际请求匹配与场景发布。
+
 服务提供**会话事件订阅（SSE）**：`GET /__events/stream` 按 `events` 表的全局
 递增 `id` 推送全部已提交事件（业务命中与超时迁移均在其中），支持按 `token`
 过滤；客户端用 `Last-Event-ID` 请求头或 `after_id` 查询参数指定补发游标
@@ -59,6 +66,7 @@ docker compose up --build -d
 | 健康检查 | <http://localhost:8080/__health> |
 | Swagger 文档 | <http://localhost:8080/docs> |
 | 场景管理 | `http://localhost:8080/__scenarios` |
+| 状态可达性诊断 | `POST http://localhost:8080/__scenarios/analyze` |
 | 版本回归对比 | `POST http://localhost:8080/__scenarios/{name}/compare` |
 | 会话状态 | `http://localhost:8080/__sessions/{token}` |
 | 虚拟时钟推进 | `POST http://localhost:8080/__sessions/{token}/advance` |
@@ -250,6 +258,7 @@ states:
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/__scenarios/validate` | 只校验不入库。body 为 YAML 文本（`Content-Type: application/yaml`）或 JSON |
+| POST | `/__scenarios/analyze` | **状态可达性诊断**：接收待发布 YAML/JSON（同 validate 的解析校验，不写库），从 `initial_state` 遍历「规则 `next_state` + 状态超时」迁移图，返回不可达状态、无法触发的规则与可达状态的最短迁移路径；无法静态确定的 `state` 条件保守保留边 |
 | GET | `/__scenarios` | 列出全部场景及解析后的结构（含 `current_revision` 与版本数 `revisions`） |
 | GET | `/__scenarios/{name}` | 查看单个场景摘要（当前版本） |
 | GET | `/__scenarios/{name}/yaml` | 取回原始 YAML；`?revision=N` 可取指定历史版本 |
@@ -433,6 +442,121 @@ revision 1 尚未到期（30 分钟）而 revision 2 已自动取消（20 分钟
 规则（400）。若某一步某侧请求了不存在的路径，该侧该步为
 `{"ok": false, "failure": {"kind": "route", "status_code": 404, ...}}` 且快照
 不变，另一侧与后续步骤照常执行；对比结束后数据库中没有新增任何会话或事件。
+
+#### 状态可达性诊断（analyze）
+
+`POST /__scenarios/analyze` 对**待发布**的场景定义做一次静态体检：复用与
+`/validate` 完全相同的解析校验（body 为 YAML 文本或 JSON，校验失败返回
+`422 {"valid": false, "error": ...}`），但**不写数据库、不创建会话**，也不影响
+实际请求匹配与场景发布。校验通过后，服务按每条规则的 `state` 条件筛选它
+**可能的源状态**，把所有规则的 `next_state` 迁移与状态超时迁移组成有向图，
+从 `initial_state` 开始遍历，回答三个问题：
+
+- **不可达状态**（`unreachable_states`）：从初始状态经任意规则/超时迁移都
+  无法进入的声明状态——通常是漏了迁移规则或写错了状态名；
+- **无法触发的规则**（`untriggerable_rules`）：可能源状态均不可达，或
+  `state` 条件在所有声明状态下都不成立（如 `eq a` 与 `eq b` 同时出现）；
+- **最短迁移路径**（`shortest_paths`）：每个可达状态从 `initial_state`
+  出发步数最少的一条迁移链，每步标注 `kind=rule`（含路由/规则名）或
+  `kind=timeout`（含 `after_ms`）。
+
+为避免误报，诊断采用**保守语义**：非 `state` 条件（body/query/header/path）
+一律视为"可能满足"，不约束源状态；`state` 条件的比较右值含 Jinja 模板
+（`{{ ... }}`）或无法静态求值时，该条件同样不约束源状态（保守保留边）。
+只有能静态确定为假的 (状态, 条件) 组合才会被剔除——静态求值复用运行时
+同一个条件判定函数，结果与真实匹配一致。响应中每条规则附带
+`possible_source_states` 与 `state_conditions_static`（所有 `state` 条件
+是否都可静态确定），便于核对诊断依据。
+
+```bash
+cat > diag-demo.yaml <<'EOF'
+name: diag-demo
+initial_state: init
+states:
+  - init
+  - name: pending
+    after_ms: 60000
+    next_state: expired
+  - done
+  - expired
+  - ghost                      # 没有任何迁移指向它
+routes:
+  - id: start
+    path: /start
+    methods: [POST]
+    rules:
+      - name: start-ok
+        when:
+          - {source: state, op: eq, value: init}
+        response: {status: 200, body: {ok: true}}
+        next_state: pending
+  - id: finish
+    path: /finish
+    methods: [POST]
+    rules:
+      - name: finish-ok
+        priority: 100
+        when:
+          - {source: state, op: eq, value: pending}
+          - {source: body, path: token, op: exists}   # 非 state 条件：视为可能满足
+        response: {status: 200, body: {done: true}}
+        next_state: done
+      - name: finish-ghost
+        priority: 50
+        when:
+          - {source: state, op: eq, value: ghost}     # 源状态不可达 -> 死规则
+        response: {status: 200, body: {ghost: true}}
+        next_state: done
+EOF
+
+curl -s -X POST $BASE/__scenarios/analyze \
+  -H 'Content-Type: application/yaml' --data-binary @diag-demo.yaml
+```
+
+响应（节选）：
+
+```json
+{
+  "valid": true,
+  "scenario": "diag-demo",
+  "initial_state": "init",
+  "reachable_states": ["init", "pending", "done", "expired"],
+  "unreachable_states": ["ghost"],
+  "rules": [
+    {"route": "start", "rule": "start-ok", "priority": 100,
+     "next_state": "pending", "possible_source_states": ["init"],
+     "state_conditions_static": true, "triggerable": true},
+    {"route": "finish", "rule": "finish-ghost", "priority": 50,
+     "next_state": "done", "possible_source_states": ["ghost"],
+     "state_conditions_static": true, "triggerable": false}
+  ],
+  "untriggerable_rules": [
+    {"route": "finish", "rule": "finish-ghost",
+     "possible_source_states": ["ghost"],
+     "reason": "规则的可能源状态均不可达"}
+  ],
+  "shortest_paths": {
+    "pending": [
+      {"kind": "rule", "route": "start", "rule": "start-ok",
+       "from": "init", "to": "pending"}
+    ],
+    "done": [
+      {"kind": "rule", "route": "start", "rule": "start-ok",
+       "from": "init", "to": "pending"},
+      {"kind": "rule", "route": "finish", "rule": "finish-ok",
+       "from": "pending", "to": "done"}
+    ],
+    "expired": [
+      {"kind": "rule", "route": "start", "rule": "start-ok",
+       "from": "init", "to": "pending"},
+      {"kind": "timeout", "from": "pending", "to": "expired", "after_ms": 60000}
+    ]
+  }
+}
+```
+
+诊断通过后可照常 `PUT /__scenarios/diag-demo` 发布；`analyze` 本身对数据库
+与已发布场景零副作用，可反复调用。
 
 ### 会话
 
@@ -963,6 +1087,7 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── config.py          # 环境变量配置
 │   ├── db.py              # 连接/WAL/建表/旧库迁移/IMMEDIATE 写事务（含只读回滚事务）与锁重试
 │   ├── scenario.py        # YAML 解析与校验（含状态超时 after_ms/next_state/set）
+│   ├── analyzer.py        # 状态可达性静态诊断：迁移图遍历、不可达状态/死规则/最短迁移路径
 │   ├── models.py          # 场景/路由/规则/状态超时数据模型
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
 │   ├── renderer.py        # Jinja2 沙箱渲染、模板函数与会话级确定性随机源（seed）
@@ -970,7 +1095,7 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── event_bus.py       # 进程内事件总线：写事务提交后唤醒 SSE 订阅者（单 worker 权威）
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
-│       ├── scenarios.py   # 场景校验/版本发布/版本列表/激活/查询/删除/版本回归对比
+│       ├── scenarios.py   # 场景校验/可达性诊断/版本发布/版本列表/激活/查询/删除/版本回归对比
 │       ├── sessions.py    # 会话创建/状态查询/advance 时钟推进/重置/fork/事件/预演
 │       └── events.py      # GET /__events/stream：SSE 事件订阅（游标补发+实时推送/token 过滤/心跳/422）
 ├── scenarios/

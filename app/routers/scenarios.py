@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ..analyzer import analyze_scenario
 from ..db import get_conn
 from ..engine import MAX_COMPARE_STEPS, CompareAbort, compare_revisions
 from ..scenario import ScenarioError, parse_scenario
@@ -185,6 +186,26 @@ async def validate_scenario(request: Request) -> JSONResponse:
     except yaml.YAMLError as exc:
         return JSONResponse(status_code=422, content={"valid": False, "error": f"YAML 解析失败: {exc}"})
     return JSONResponse({"valid": True, "scenario": _summary(scenario)})
+
+
+@router.post("/analyze")
+async def analyze_scenario_definition(request: Request) -> JSONResponse:
+    """**状态可达性诊断**：接收待发布的场景定义（YAML 文本或 JSON，同
+    ``/validate``），复用同一套解析校验但**不写数据库**；按每条规则的
+    state 条件筛选可能的源状态，把规则的 ``next_state`` 与状态超时迁移
+    组成有向图，从 ``initial_state`` 遍历，返回**不可达状态**、
+    **无法触发的规则**与每个可达状态的**最短迁移路径**。非 state 条件
+    只视为可能满足；含模板或无法静态确定的 state 条件保守保留边，避免
+    误报不可达。诊断不影响实际请求匹配与场景发布。
+    """
+    text = await _read_definition(request)
+    try:
+        scenario = parse_scenario(text)
+    except ScenarioError as exc:
+        return JSONResponse(status_code=422, content={"valid": False, "error": str(exc)})
+    except yaml.YAMLError as exc:
+        return JSONResponse(status_code=422, content={"valid": False, "error": f"YAML 解析失败: {exc}"})
+    return JSONResponse(analyze_scenario(scenario))
 
 
 @router.get("")
